@@ -59,6 +59,11 @@ pub struct Node {
     /// unchanged. Only internal nodes keep one: leaves are ~3/4 of the nodes
     /// and bytes, and every proof path has just one.
     pub bytes: Option<Arc<[u8]>>,
+    /// The length of the block `cid` names, set with it (0 without a cid,
+    /// and for a stub). A dirty node keeps its last written version's, as
+    /// it keeps that cid, so a write that replaces it knows the size it
+    /// frees without encoding the old version again.
+    pub block_len: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -102,18 +107,23 @@ pub fn height_for_key(key: &[u8]) -> i32 {
     128
 }
 
+/// A block's length as [`Node::block_len`] holds it.
+pub fn block_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 fn valid_key(key: &[u8]) -> bool {
     !key.is_empty() && key.len() <= MAX_KEY_BYTES
 }
 
 impl Node {
     fn empty(height: i32) -> Node {
-        Node { height, entries: Vec::new(), cid: None, dirty: true, stub: false, bytes: None }
+        Node { height, entries: Vec::new(), cid: None, dirty: true, stub: false, bytes: None, block_len: 0 }
     }
 
     /// A node as decoded or built: not dirty, no cached block.
     pub fn clean(height: i32, entries: Vec<Entry>, cid: Option<Cid>) -> Node {
-        Node { height, entries, cid, dirty: false, stub: false, bytes: None }
+        Node { height, entries, cid, dirty: false, stub: false, bytes: None, block_len: 0 }
     }
 
     fn stub(height: i32, cid: Option<Cid>) -> Node {
@@ -721,6 +731,7 @@ fn write_blocks(
     }
     let c = match (nm.cid, &nm.bytes) {
         (Some(c), Some(b)) => {
+            nm.block_len = block_len(b.len());
             if let Some(out) = out.as_mut() {
                 out.push((c, b.to_vec()));
             }
@@ -731,6 +742,7 @@ fn write_blocks(
             encode_node(nm, &mut buf)?;
             let c = Cid::dag_cbor(&buf);
             nm.cid = Some(c);
+            nm.block_len = block_len(buf.len());
             if nm.height >= 1 {
                 nm.bytes = Some(Arc::from(&buf[..]));
             }
@@ -864,7 +876,7 @@ fn decode_node_fast(data: &[u8], c: Cid, known_height: Option<i32>) -> Option<No
     if height == 0 && has_child {
         return None;
     }
-    Some(Node::clean(height, entries, Some(c)))
+    Some(Node { block_len: block_len(data.len()), ..Node::clean(height, entries, Some(c)) })
 }
 
 /// The generic decoder: the oracle for [`decode_node_fast`] and the source
@@ -936,7 +948,7 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> Result<Node> {
     if height == 0 && entries.iter().any(Entry::is_child) {
         return Err(MstError::Invalid("child of a height-0 node"));
     }
-    Ok(Node::clean(height, entries, Some(c)))
+    Ok(Node { block_len: block_len(data.len()), ..Node::clean(height, entries, Some(c)) })
 }
 
 /// One load of a (possibly partial) tree from an untrusted block set.
