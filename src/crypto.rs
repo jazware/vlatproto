@@ -285,6 +285,34 @@ unsafe extern "C" fn rfc6979_nonce(
 
 /// Compact signature over sha256(msg); high-S is rejected, as `k256` and the
 /// reference do. Err: malformed key or signature encoding.
+/// Verifies a compact signature against a multikey (`z` base58btc of the
+/// multicodec key: secp256k1 or P-256). `allow_high_s`: inter-service JWTs
+/// only, as the reference's `allowMalleableSig`; elsewhere high-S is
+/// Ok(false).
+pub fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) -> Result<bool, String> {
+    let raw = bs58::decode(multibase.strip_prefix('z').ok_or("unsupported multibase")?)
+        .into_vec()
+        .map_err(|e| e.to_string())?;
+    match raw.as_slice() {
+        [0xe7, 0x01, key @ ..] => {
+            if allow_high_s { verify_k256_malleable(key, msg, sig) } else { verify_k256(key, msg, sig) }
+                .map_err(|e| e.to_string())
+        }
+        [0x80, 0x24, key @ ..] => {
+            use p256::ecdsa::signature::Verifier;
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key).map_err(|e| e.to_string())?;
+            let s = p256::ecdsa::Signature::from_slice(sig).map_err(|e| e.to_string())?;
+            // `p256` itself accepts both forms; a different low-S form = it was high-S
+            let low = s.normalize_s();
+            if low != s && !allow_high_s {
+                return Ok(false);
+            }
+            Ok(vk.verify(msg, &low).is_ok())
+        }
+        _ => Err("unsupported key type".into()),
+    }
+}
+
 pub fn verify_k256(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8]) -> anyhow::Result<bool> {
     verify_k256_inner(pubkey_sec1, msg, sig, false)
 }
@@ -472,6 +500,25 @@ pub fn random_plc_did() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Multikeys of both curves verify, and a changed message doesn't.
+    #[test]
+    fn verify_multikey_both_curves() {
+        let k = Keypair::from_bytes(&[3u8; 32]).unwrap();
+        let sig = k.sign(b"header.payload");
+        assert_eq!(verify_multikey(&k.public_multibase(), b"header.payload", &sig, true), Ok(true));
+        assert_eq!(verify_multikey(&k.public_multibase(), b"header.payloaX", &sig, true), Ok(false));
+        use p256::ecdsa::signature::Signer;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let mut b = vec![0x80, 0x24];
+        b.extend_from_slice(&sk.verifying_key().to_sec1_bytes());
+        let mb = format!("z{}", bs58::encode(b).into_string());
+        let sig: p256::ecdsa::Signature = sk.sign(b"header.payload");
+        let sig = sig.normalize_s();
+        assert_eq!(verify_multikey(&mb, b"header.payload", &sig.to_bytes(), false), Ok(true));
+        assert_eq!(verify_multikey(&mb, b"header.payloaX", &sig.to_bytes(), false), Ok(false));
+        assert!(verify_multikey("zabc", b"m", &[0; 64], true).is_err(), "an unknown key type");
+    }
+
     use super::*;
     use rand::{Rng, SeedableRng};
     use secp256k1::ffi;
