@@ -90,6 +90,21 @@ pub fn write_bool(out: &mut Vec<u8>, b: bool) {
     out.push(if b { 0xf5 } else { 0xf4 });
 }
 
+pub fn write_float(out: &mut Vec<u8>, f: f64) {
+    out.push(0xfb);
+    out.extend_from_slice(&f.to_bits().to_be_bytes());
+}
+
+/// As JavaScript prints it: integral floats in the safe range without a
+/// fraction, so `2.0` reads back as the reference's `2`.
+fn float_json(f: f64) -> serde_json::Value {
+    if f.fract() == 0.0 && f.abs() <= MAX_SAFE_INT {
+        serde_json::Value::from(f as i64)
+    } else {
+        serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number)
+    }
+}
+
 /// Tag 42, a 37-byte byte string head, the 0x00 multibase-identity prefix.
 const LINK_PREFIX: [u8; 5] = [0xd8, 0x2a, 0x58, 0x25, 0x00];
 
@@ -126,6 +141,10 @@ pub enum Value {
     Null,
     Bool(bool),
     Int(i64),
+    /// Finite, decoded from a 64-bit CBOR float. Not in the data model, so
+    /// writes refuse it, but repos from other PDSes hold records with floats
+    /// (the reference decodes them, as DRISL allows) and imports must keep them.
+    Float(f64),
     Bytes(Vec<u8>),
     Text(String),
     Array(Vec<Value>),
@@ -150,6 +169,7 @@ impl Value {
             Value::Null => write_null(out),
             Value::Bool(b) => write_bool(out, *b),
             Value::Int(n) => write_int(out, *n),
+            Value::Float(f) => write_float(out, *f),
             Value::Bytes(b) => write_bytes(out, b),
             Value::Text(s) => write_text(out, s),
             Value::Array(a) => {
@@ -269,6 +289,7 @@ impl Value {
             Value::Null => J::Null,
             Value::Bool(b) => J::Bool(*b),
             Value::Int(n) => J::from(*n),
+            Value::Float(f) => float_json(*f),
             Value::Bytes(b) => serde_json::json!({
                 "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(b)
             }),
@@ -332,6 +353,7 @@ pub enum ValueRef<'a> {
     Null,
     Bool(bool),
     Int(i64),
+    Float(f64),
     Bytes(&'a [u8]),
     Text(&'a str),
     Array(Vec<ValueRef<'a>>),
@@ -377,6 +399,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Null => Value::Null,
             ValueRef::Bool(b) => Value::Bool(*b),
             ValueRef::Int(n) => Value::Int(*n),
+            ValueRef::Float(f) => Value::Float(*f),
             ValueRef::Bytes(b) => Value::Bytes(b.to_vec()),
             ValueRef::Text(s) => Value::Text(s.to_string()),
             ValueRef::Array(a) => Value::Array(a.iter().map(ValueRef::to_value).collect()),
@@ -431,6 +454,9 @@ impl RecordRefs {
         self.blobs.iter().map(|(c, ..)| *c).filter(|c| seen.insert(*c)).collect()
     }
 }
+
+/// `Decoder::head`'s major type for a float, whose argument is its bits.
+const FLOAT: u8 = 8;
 
 /// JS's `Number.MAX_SAFE_INTEGER`.
 const MAX_SAFE_INT: f64 = 9_007_199_254_740_991.0;
@@ -770,12 +796,21 @@ impl<'a> Decoder<'a> {
         let b = self.byte()?;
         let major = b >> 5;
         let info = b & 31;
-        // major 7: only the one-byte false/true/null; floats (25-27), two-byte
-        // simple values (24) and the other simple values are not data model
+        // major 7: the one-byte false/true/null, and finite 64-bit floats as
+        // DRISL allows (returned as `FLOAT` with the bits); half and single
+        // floats, two-byte simple values (24) and the other simple values are
+        // not
         if major == 7 {
             return match info {
                 20..=22 => Ok((7, info as u64)),
-                _ => Err(CborError::Invalid("floats/simple values not allowed")),
+                27 => {
+                    let bits = u64::from_be_bytes(self.take(8)?.try_into().unwrap());
+                    if !f64::from_bits(bits).is_finite() {
+                        return Err(CborError::Invalid("NaN or infinite float"));
+                    }
+                    Ok((FLOAT, bits))
+                }
+                _ => Err(CborError::Invalid("half/single floats and simple values not allowed")),
             };
         }
         let (n, min) = match info {
@@ -839,6 +874,7 @@ impl<'a> Decoder<'a> {
                 21 => Value::Bool(true),
                 _ => Value::Null,
             },
+            FLOAT => Value::Float(f64::from_bits(n)),
             _ => unreachable!(),
         })
     }
@@ -923,6 +959,7 @@ impl<'a> Decoder<'a> {
                 21 => Value::Bool(true),
                 _ => Value::Null,
             },
+            FLOAT => Value::Float(f64::from_bits(n)),
             _ => unreachable!(),
         })
     }
@@ -964,6 +1001,7 @@ impl<'a> Decoder<'a> {
                 21 => ValueRef::Bool(true),
                 _ => ValueRef::Null,
             },
+            FLOAT => ValueRef::Float(f64::from_bits(n)),
             _ => unreachable!(),
         })
     }
@@ -1211,6 +1249,9 @@ impl<'a> Decoder<'a> {
                 21 => b"true",
                 _ => b"null",
             }),
+            FLOAT => {
+                let _ = serde_json::to_writer(&mut *out, &float_json(f64::from_bits(n)));
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -1428,26 +1469,72 @@ mod tests {
     }
 
     #[test]
-    fn major_7_only_false_true_null() {
+    fn major_7_false_true_null_and_f64() {
         assert_eq!(Value::decode(&[0xf4]).unwrap(), Value::Bool(false));
         assert_eq!(Value::decode(&[0xf5]).unwrap(), Value::Bool(true));
         assert_eq!(Value::decode(&[0xf6]).unwrap(), Value::Null);
         for b in [
-            &[0xf7][..],                                             // undefined
-            &[0xf0],                                                 // simple(16)
-            &[0xf8, 0x14],                                           // two-byte simple(20)
-            &[0xf8, 0x16],                                           // two-byte simple(22)
-            &[0xf8, 0xff],                                           // simple(255)
-            &[0xf9, 0x00, 0x14],                                     // f16 with bits 20
-            &[0xf9, 0x3c, 0x00],                                     // f16 1.0
-            &[0xfa, 0x00, 0x00, 0x00, 0x15],                         // f32 with bits 21
-            &[0xfb, 0, 0, 0, 0, 0, 0, 0, 0x16],                      // f64 with bits 22
-            &[0xfb, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18], // f64 pi
-            &[0xff],                                                 // break
+            &[0xf7][..],                           // undefined
+            &[0xf0],                               // simple(16)
+            &[0xf8, 0x14],                         // two-byte simple(20)
+            &[0xf8, 0x16],                         // two-byte simple(22)
+            &[0xf8, 0xff],                         // simple(255)
+            &[0xf9, 0x00, 0x14],                   // f16 with bits 20
+            &[0xf9, 0x3c, 0x00],                   // f16 1.0
+            &[0xfa, 0x00, 0x00, 0x00, 0x15],       // f32 with bits 21
+            &[0xfa, 0x41, 0x84, 0x00, 0x00],       // f32 16.5
+            &[0xfb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0], // f64 NaN
+            &[0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0], // f64 +inf
+            &[0xfb, 0xff, 0xf0, 0, 0, 0, 0, 0, 0], // f64 -inf
+            &[0xfb, 0x40, 0x09],                   // short f64
+            &[0xff],                               // break
         ] {
             assert!(Value::decode(b).is_err(), "{b:02x?} accepted");
+            assert!(ValueRef::decode(b).is_err(), "{b:02x?} accepted by ValueRef");
             assert!(write_json(b, &mut Vec::new()).is_err(), "{b:02x?} transcoded");
         }
+        for (b, f) in [
+            (&[0xfb, 0, 0, 0, 0, 0, 0, 0, 0x16][..], f64::from_bits(0x16)),
+            (&[0xfb, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18], std::f64::consts::PI),
+        ] {
+            assert_eq!(Value::decode(b).unwrap(), Value::Float(f));
+            assert_eq!(ValueRef::decode(b).unwrap(), ValueRef::Float(f));
+            assert_eq!(Value::Float(f).to_cbor(), b);
+        }
+    }
+
+    /// A record another PDS stored with a float (jazware/vlpds#8) decodes,
+    /// transcodes and scans like any other, and the float re-encodes to the
+    /// same bytes; writes from JSON still refuse floats.
+    #[test]
+    fn stored_records_may_hold_floats() {
+        let mut b = Vec::new();
+        write_map_head(&mut b, 4);
+        write_text(&mut b, "foo");
+        write_array_head(&mut b, 3);
+        write_text(&mut b, "bar");
+        write_float(&mut b, 16.5);
+        write_float(&mut b, 2.0);
+        write_text(&mut b, "key");
+        write_text(&mut b, "value");
+        write_text(&mut b, "$type");
+        write_text(&mut b, "random.nonsense.lol");
+        write_text(&mut b, "number");
+        write_int(&mut b, 12);
+        let want = serde_json::json!({
+            "foo": ["bar", 16.5, 2], "key": "value", "$type": "random.nonsense.lol", "number": 12
+        });
+        let v = Value::decode(&b).unwrap();
+        assert_eq!(v.to_json(), want);
+        assert_eq!(v.to_cbor(), b);
+        let mut out = Vec::new();
+        write_json(&b, &mut out).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&out).unwrap(), want);
+        assert_eq!(scan_blob_refs(&b).unwrap(), vec![]);
+        assert!(Value::from_json(&serde_json::json!({"f": 16.5})).is_err());
+        let mut refs = RecordRefs::default();
+        let body = br#"{"$type": "x.y", "f": 16.5}"#;
+        assert!(JsonValue::parse(body).unwrap().encode_record(&mut Vec::new(), &mut refs).is_err());
     }
 
     #[test]
