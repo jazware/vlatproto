@@ -22,7 +22,6 @@ base64 = "0.23"
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
-hex = "0.4"
 parking_lot = "0.12"
 prometheus = { version = "0.14", default-features = false }
 rand = "0.8"
@@ -45,6 +44,7 @@ zeroize = { version = "1", features = ["derive"] }
 [dev-dependencies]
 # tests cross-check libsecp256k1 signatures against RustCrypto
 k256 = { version = "0.14", features = ["ecdsa"] }
+hex = "0.4"
 
 # `cargo test` here: quick to build and link, still fast enough to run
 # (crypto, CBOR and MST code is slow at opt-level 0), as vlpds's.
