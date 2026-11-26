@@ -227,11 +227,26 @@ pub fn service_endpoint(doc: &J, service_id: &str) -> Option<String> {
 }
 
 pub fn signing_key_multibase(doc: &J) -> Option<String> {
+    method_multibase(doc, "atproto")
+}
+
+/// The `publicKeyMultibase` of the verification method `#{fragment}`.
+pub fn method_multibase(doc: &J, fragment: &str) -> Option<String> {
     let did = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let full = format!("{did}#atproto");
+    let (short, full) = (format!("#{fragment}"), format!("{did}#{fragment}"));
     doc.get("verificationMethod")?.as_array()?.iter().find_map(|m| {
         let id = m.get("id")?.as_str()?;
-        (id == "#atproto" || id == full).then(|| m.get("publicKeyMultibase")?.as_str().map(String::from))?
+        (id == short || id == full).then(|| m.get("publicKeyMultibase")?.as_str().map(String::from))?
+    })
+}
+
+/// Whether the document lists a verification method `#{fragment}`, with or
+/// without key material.
+pub fn has_method(doc: &J, fragment: &str) -> bool {
+    let did = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let (short, full) = (format!("#{fragment}"), format!("{did}#{fragment}"));
+    doc.get("verificationMethod").and_then(|v| v.as_array()).is_some_and(|ms| {
+        ms.iter().any(|m| m.get("id").and_then(|i| i.as_str()).is_some_and(|id| id == short || id == full))
     })
 }
 

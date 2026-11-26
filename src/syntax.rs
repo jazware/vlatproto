@@ -71,7 +71,10 @@ pub fn valid_did(s: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:%-".contains(&b))
 }
 
-/// A space URI without its fragment: `at://{space DID}/space/{space type
+/// The prefix of a space URI, in place of a public one's `at://`.
+pub const SPACE_URI_PREFIX: &str = "at:space/";
+
+/// A space URI without its fragment: `at:space/{space DID}/{space type
 /// NSID}/{skey}`, plus `/{author DID}/{collection}/{rkey}` for a record in
 /// it (@atproto/syntax `parseSpaceAtUriString`, strict). Both DIDs must be
 /// DIDs, not handles, and the skey follows the record-key syntax.
@@ -84,16 +87,54 @@ pub struct SpaceUri<'a> {
     pub record: Option<(&'a str, &'a str, &'a str)>,
 }
 
+impl std::fmt::Display for SpaceUri<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{SPACE_URI_PREFIX}{}/{}/{}", self.authority, self.space_type, self.skey)?;
+        if let Some((a, c, r)) = self.record {
+            write!(f, "/{a}/{c}/{r}")?;
+        }
+        Ok(())
+    }
+}
+
+impl SpaceUri<'_> {
+    /// The space's own URI, without a record's path.
+    pub fn space(&self) -> String {
+        format!("{SPACE_URI_PREFIX}{}/{}/{}", self.authority, self.space_type, self.skey)
+    }
+}
+
+/// A space URI in the only form hosts accept: `at:space/...`.
 pub fn parse_space_uri(s: &str) -> Option<SpaceUri<'_>> {
-    let mut parts = s.strip_prefix("at://")?.split('/');
-    let (authority, marker, space_type, skey) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let (authority, rest) = s.strip_prefix(SPACE_URI_PREFIX)?.split_once('/')?;
+    space_parts(authority, rest)
+}
+
+/// A space URI in either form: `at:space/...`, or the alpha's
+/// `at://{space DID}/space/...` that records written before the Nov 24
+/// alpha may embed (@atproto/syntax with `strict: false`). Only for values
+/// read back, never for params, tokens, MAC headers or archives.
+// @TODO remove with the reference's fromLegacySpaceUri, before beta.
+pub fn parse_space_uri_lenient(s: &str) -> Option<SpaceUri<'_>> {
+    match s.strip_prefix("at://") {
+        Some(rest) => {
+            let (authority, rest) = rest.split_once('/')?;
+            space_parts(authority, rest.strip_prefix("space/")?)
+        }
+        None => parse_space_uri(s),
+    }
+}
+
+/// `{type}/{skey}[/{author}/{collection}/{rkey}]` under `authority`.
+fn space_parts<'a>(authority: &'a str, rest: &'a str) -> Option<SpaceUri<'a>> {
+    let mut parts = rest.split('/');
+    let (space_type, skey) = (parts.next()?, parts.next()?);
     let record = match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (None, ..) => None,
         (Some(a), Some(c), Some(r), None) => Some((a, c, r)),
         _ => return None,
     };
-    let ok = marker == "space"
-        && valid_did(authority)
+    let ok = valid_did(authority)
         && valid_nsid(space_type)
         && valid_rkey(skey)
         && record.is_none_or(|(a, c, r)| valid_did(a) && valid_nsid(c) && valid_rkey(r));
@@ -140,6 +181,46 @@ mod tests {
         assert!(!valid_handle("alice.-bsky.social"));
         assert!(!valid_handle("alice.bsky.1social"));
         assert!(!valid_handle("al_ice.bsky.social"));
+    }
+
+    #[test]
+    fn space_uris() {
+        let space = "at:space/did:plc:abc/com.example.group/self";
+        let rec = "at:space/did:web:a.example/com.example.group/k/did:plc:alice/com.example.post/3jui7kd54zh2y";
+        let u = parse_space_uri(space).unwrap();
+        assert_eq!((u.authority, u.space_type, u.skey, u.record), ("did:plc:abc", "com.example.group", "self", None));
+        assert_eq!(u.to_string(), space);
+        let r = parse_space_uri(rec).unwrap();
+        assert_eq!(r.record, Some(("did:plc:alice", "com.example.post", "3jui7kd54zh2y")));
+        assert_eq!(
+            (r.to_string().as_str(), r.space().as_str()),
+            (rec, "at:space/did:web:a.example/com.example.group/k")
+        );
+        assert_eq!(
+            parse_space_uri("at:space/did:web:a_b.example/com.example.group/k").unwrap().authority,
+            "did:web:a_b.example"
+        );
+        for bad in [
+            "at://did:plc:abc/space/com.example.group/self",
+            "at:space/alice.test/com.example.group/self",
+            "at:space/did:plc:abc/com.example.group",
+            "at:space/did:plc:abc/com.example.group/self/",
+            "at:space/did:plc:abc/com.example.group/self/did:plc:alice/com.example.post",
+            "at:space/did:plc:abc/com.example.group/self/alice.test/com.example.post/x",
+            "at:space/did:plc:abc/com.example.group/..",
+            "at:space//com.example.group/self",
+            "at:space/did:plc:abc/space/com.example.group/self",
+        ] {
+            assert!(parse_space_uri(bad).is_none(), "{bad}");
+        }
+        let old = "at://did:plc:abc/space/com.example.group/self";
+        assert_eq!(parse_space_uri_lenient(old).unwrap().to_string(), space);
+        assert_eq!(parse_space_uri_lenient(space), parse_space_uri(space));
+        let old_rec = "at://did:web:a.example/space/com.example.group/k/did:plc:alice/com.example.post/3jui7kd54zh2y";
+        assert_eq!(parse_space_uri_lenient(old_rec).unwrap().to_string(), rec);
+        for bad in ["at://alice.test/space/com.example.group/self", "at://did:plc:abc/com.example.group/self"] {
+            assert!(parse_space_uri_lenient(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
